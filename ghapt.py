@@ -33,7 +33,7 @@ import urllib.request
 import zipfile
 from datetime import datetime, timezone
 from functools import cmp_to_key
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 API_ROOT = "https://api.github.com"
 USER_AGENT = "ghapt/1.0"
@@ -44,6 +44,15 @@ ARCHIVE_SUFFIXES = (".tar.gz", ".tgz", ".tar.xz", ".tar.bz2", ".tar")
 # tarfile 原生不支持 zstd(Python 3.14 才有),用系统 zstd 先解一层
 ZSTD_SUFFIXES = (".tar.zst", ".tzst")
 ELF_MAGIC = b"\x7fELF"
+PATH_PART_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9+._~-]*$")
+
+
+def _config_path_part(value, label):
+    """Validate a configuration value used as one path component."""
+    if not isinstance(value, str) or not PATH_PART_RE.fullmatch(value):
+        raise ConfigError(
+            f"{label} 不是安全的单一路径组成部分: {value!r}")
+    return value
 
 
 # ── 配置 ──────────────────────────────────────────────────────────────
@@ -58,9 +67,15 @@ class Settings:
         self.repo_dir = Path(s.get("repo_dir", "/srv/ghapt/repo"))
         self.state_file = Path(s.get("state_file", str(self.repo_dir.parent / "state.json")))
         self.gpg_home = Path(s.get("gpg_home", str(self.repo_dir.parent / "gnupg")))
-        self.suite = s.get("suite", "stable")
-        self.component = s.get("component", "main")
+        self.suite = _config_path_part(s.get("suite", "stable"), "suite")
+        self.component = _config_path_part(s.get("component", "main"), "component")
         self.architectures = s.get("architectures", "amd64 arm64").split()
+        if not self.architectures:
+            raise ConfigError("architectures 不能为空")
+        if len(set(self.architectures)) != len(self.architectures):
+            raise ConfigError("architectures 不能包含重复项")
+        for arch in self.architectures:
+            _config_path_part(arch, "architecture")
         self.origin = s.get("origin", "ghapt")
         self.label = s.get("label", "ghapt")
         self.description = s.get("description", "Self-hosted APT repo synced from GitHub releases")
@@ -98,11 +113,14 @@ class Project:
         self.type = sec.get("type", "deb").strip()
         if self.type not in ("deb", "binary"):
             raise ConfigError(f"type 必须是 deb 或 binary(当前 {self.type!r})")
-        self.package = sec.get("package", name).strip()
+        self.package = _config_path_part(
+            sec.get("package", name).strip(), "package")
         self.assets = {k[len("asset."):]: sec[k].strip()
                        for k in sec if k.startswith("asset.")}
         if not self.assets:
             raise ConfigError(f"至少需要一条 asset.<arch> = <正则>")
+        for arch in self.assets:
+            _config_path_part(arch, "asset 架构")
 
         # asset.<arch> 的键必须出现在 architectures 里。
         # binary 模式下这个键会被直接写进 control 的 Architecture,
@@ -144,8 +162,11 @@ def load_config(path, strict=True):
     某个项目配置写错不应该让其它项目都同步不了)。
     """
     cp = configparser.ConfigParser(interpolation=None, delimiters=("=",))
-    if not cp.read(path, encoding="utf-8"):
-        sys.exit(f"读不到配置文件: {path}")
+    try:
+        if not cp.read(path, encoding="utf-8"):
+            sys.exit(f"读不到配置文件: {path}")
+    except (configparser.Error, UnicodeError) as e:
+        sys.exit(f"配置文件无法解析: {path}: {e}")
 
     try:
         st = Settings(cp)
@@ -186,25 +207,46 @@ def with_retry(fn, attempts=3, delay=3):
         time.sleep(delay)
 
 
-def gh_json(path, token):
+def gh_json_response(path, token):
     headers = {"User-Agent": USER_AGENT, "Accept": "application/vnd.github+json"}
     if token:
         headers["Authorization"] = "Bearer " + token
 
     def go():
-        req = urllib.request.Request(API_ROOT + path, headers=headers)
+        url = path if "://" in path else API_ROOT + path
+        req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req, timeout=60) as resp:
-            return json.load(resp)
+            return json.load(resp), resp.headers
     return with_retry(go)
+
+
+def gh_json(path, token):
+    return gh_json_response(path, token)[0]
+
+
+def _next_link(headers):
+    raw = headers.get("Link", "") if headers else ""
+    for part in raw.split(","):
+        match = re.search(r"<([^>]+)>\s*;\s*rel=\"([^\"]+)\"", part)
+        if match and "next" in {x.strip() for x in match.group(2).split()}:
+            return match.group(1)
+    return None
 
 
 def latest_release(project, token):
     if project.prerelease:
-        rels = gh_json(f"/repos/{project.repo}/releases?per_page=10", token)
-        rels = [r for r in rels if not r.get("draft")]
-        if not rels:
-            raise RuntimeError("没有找到任何 release")
-        return rels[0]
+        path = f"/repos/{project.repo}/releases?per_page=10"
+        seen = set()
+        while path and path not in seen:
+            seen.add(path)
+            rels, headers = gh_json_response(path, token)
+            if not isinstance(rels, list):
+                raise RuntimeError("GitHub releases API 返回了非列表数据")
+            usable = [r for r in rels if not r.get("draft")]
+            if usable:
+                return usable[0]
+            path = _next_link(headers)
+        raise RuntimeError("没有找到任何 release")
     return gh_json(f"/repos/{project.repo}/releases/latest", token)
 
 
@@ -527,22 +569,31 @@ def prune_pool_plan(pooldir: Path, pkg, arch, keep):
     if keep <= 0:
         return []
 
-    def ver_of(p):
-        return p.stem.split("_")[1].replace("%3a", ":")
-    files = sorted(pooldir.glob(f"{pkg}_*_{arch}.deb"),
-                   key=cmp_to_key(lambda a, b: dpkg_vercmp(ver_of(a), ver_of(b))))
-    return files[:-keep]
+    pkg = _path_part(pkg, "Package")
+    arch = _path_part(arch, "Architecture")
+    files = []
+    for p in pooldir.glob("*.deb"):
+        version, file_arch = _pool_deb_parts(p, pkg)
+        if file_arch == arch:
+            files.append((p, version))
+    files.sort(key=cmp_to_key(lambda a, b: dpkg_vercmp(a[1], b[1])))
+    return [p for p, _version in files[:-keep]]
 
 
 def prune_candidates(st):
-    """全仓库范围内按 keep_versions 应当清理的文件(仍然不删除)。"""
-    pool = st.repo_dir / "pool"
+    """当前 component 范围内按 keep_versions 应当清理的文件(仍然不删除)。"""
+    component = _path_part(st.component, "component")
+    pool = st.repo_dir / "pool" / component
     if st.keep_versions <= 0 or not pool.is_dir():
         return []
     out = []
     for pooldir in sorted({p.parent for p in pool.rglob("*.deb")}):
-        pkg = pooldir.name
-        for arch in sorted({p.stem.split("_")[-1] for p in pooldir.glob("*.deb")}):
+        pkg = _path_part(pooldir.name, "Package")
+        arches = set()
+        for p in pooldir.glob("*.deb"):
+            _version, arch = _pool_deb_parts(p, pkg)
+            arches.add(arch)
+        for arch in sorted(arches):
             out += prune_pool_plan(pooldir, pkg, arch, st.keep_versions)
     return out
 
@@ -553,6 +604,34 @@ def _path_part(value, label):
             or os.path.isabs(value) or "/" in value or "\\" in value):
         raise RuntimeError(f"{label} 不是安全的单一路径组成部分: {value!r}")
     return value
+
+
+def _pool_deb_parts(path, pkg):
+    """Parse the canonical pool filename and return (version, architecture)."""
+    prefix = f"{pkg}_"
+    suffix = ".deb"
+    name = path.name
+    if not name.startswith(prefix) or not name.endswith(suffix):
+        raise RuntimeError(
+            f"pool 中的 deb 文件名格式错误: {path}"
+            f"(期望 {pkg}_<version>_<architecture>.deb)")
+    body = name[len(prefix):-len(suffix)]
+    try:
+        encoded_version, arch = body.rsplit("_", 1)
+    except ValueError as e:
+        raise RuntimeError(
+            f"pool 中的 deb 文件名格式错误: {path}"
+            f"(缺少版本或架构)") from e
+    if not encoded_version or not arch:
+        raise RuntimeError(
+            f"pool 中的 deb 文件名格式错误: {path}"
+            f"(版本或架构为空)")
+    arch = _path_part(arch, "Architecture")
+    version = encoded_version.replace("%3a", ":")
+    if not valid_version(version):
+        raise RuntimeError(
+            f"pool 中的 deb 文件名包含非法版本 {version!r}: {path}")
+    return version, arch
 
 
 def _pool_target(st, metadata):
@@ -768,17 +847,76 @@ def load_hash_cache(st):
     """
     try:
         raw = json.loads((st.state_file.parent / HASH_CACHE_NAME).read_text())
-    except (OSError, ValueError):
+    except (OSError, ValueError, UnicodeError):
         return {}
-    return {k: v for k, v in raw.items() if isinstance(v, list) and len(v) == 5}
+    if not isinstance(raw, dict):
+        return {}
+
+    cache = {}
+    for rel, value in raw.items():
+        if not isinstance(rel, str) or not _is_safe_repo_deb_path(st, rel):
+            continue
+        if _valid_hash_cache_entry(value):
+            cache[rel] = value
+    return cache
+
+
+def _valid_hash_cache_entry(value):
+    if not isinstance(value, list) or len(value) != 5:
+        return False
+    size, mtime_ns, md5, sha1, sha256 = value
+    if (isinstance(size, bool) or not isinstance(size, int) or size < 0
+            or isinstance(mtime_ns, bool) or not isinstance(mtime_ns, int)
+            or mtime_ns < 0):
+        return False
+    for digest, length in ((md5, 32), (sha1, 40), (sha256, 64)):
+        if (not isinstance(digest, str) or len(digest) != length
+                or re.fullmatch(r"[0-9a-fA-F]+", digest) is None):
+            return False
+    return True
+
+
+def _is_safe_repo_deb_path(st, value):
+    if (not isinstance(value, str) or not value or "\\" in value
+            or not value.endswith(".deb")):
+        return False
+    rel = PurePosixPath(value)
+    if (rel.is_absolute() or rel.as_posix() != value
+            or not rel.parts or rel.parts[0] != "pool"
+            or any(part in ("", ".", "..") for part in rel.parts)):
+        return False
+    root = st.repo_dir.resolve()
+    target = (st.repo_dir / Path(*rel.parts)).resolve(strict=False)
+    return target != root and root in target.parents
+
+
+def atomic_write_text(path, text):
+    """Write text through a unique sibling temporary file and replace atomically."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    open_fd = fd
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            open_fd = -1
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_name, path)
+    except BaseException:
+        if open_fd != -1:
+            os.close(open_fd)
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def save_hash_cache(st, cache):
     try:
         p = st.state_file.parent / HASH_CACHE_NAME
-        tmp = p.with_name(p.name + ".tmp")
-        tmp.write_text(json.dumps(cache, sort_keys=True) + "\n")
-        os.replace(tmp, p)
+        atomic_write_text(p, json.dumps(cache, sort_keys=True) + "\n")
     except OSError as e:
         print(f"    (哈希缓存写入失败,忽略: {e})", file=sys.stderr)
 
@@ -786,7 +924,8 @@ def save_hash_cache(st, cache):
 def hashes_of(path: Path, rel, cache):
     stt = path.stat()
     hit = cache.get(rel)
-    if hit and hit[0] == stt.st_size and hit[1] == stt.st_mtime_ns:
+    if (_valid_hash_cache_entry(hit)
+            and hit[0] == stt.st_size and hit[1] == stt.st_mtime_ns):
         return stt.st_size, hit[2], hit[3], hit[4]
     size, md5, sha1, sha256 = file_hashes(path)
     cache[rel] = [size, stt.st_mtime_ns, md5, sha1, sha256]
@@ -803,14 +942,18 @@ def generate_indexes(st, exclude=(), cache=None):
     cache = {} if cache is None else cache
     seen = set()
     debs = []
-    pool = st.repo_dir / "pool"
+    component = _path_part(st.component, "component")
+    pool = st.repo_dir / "pool" / component
     if pool.is_dir():
         for p in sorted(pool.rglob("*.deb")):
             relpath = p.relative_to(st.repo_dir).as_posix()
             if str(p) in excluded or relpath in excluded:
                 continue
-            fields, d = deb_control(p)
-            size, md5, sha1, sha256 = hashes_of(p, relpath, cache)
+            try:
+                fields, d = deb_control(p)
+                size, md5, sha1, sha256 = hashes_of(p, relpath, cache)
+            except (OSError, RuntimeError, ValueError) as e:
+                raise RuntimeError(f"无法读取 pool 中的 deb {p}: {e}") from e
             seen.add(relpath)
             debs.append((relpath, fields, d, size, md5, sha1, sha256))
     for gone in [k for k in cache if k not in seen]:
@@ -1108,6 +1251,30 @@ class StateError(RuntimeError):
     """state.json 缺失或损坏。继续操作可能误删整个仓库,所以直接拒绝。"""
 
 
+def _validate_state(st, raw):
+    if not isinstance(raw, dict):
+        raise StateError("state 顶层必须是 JSON 对象")
+    for project_name, record in raw.items():
+        if not isinstance(project_name, str) or not project_name:
+            raise StateError("state 项目名必须是非空字符串")
+        if not isinstance(record, dict):
+            raise StateError(f"state 项目 {project_name!r} 必须是 JSON 对象")
+        if not isinstance(record.get("tag"), str):
+            raise StateError(f"state 项目 {project_name!r} 的 tag 必须是字符串")
+        files = record.get("files")
+        if not isinstance(files, dict):
+            raise StateError(f"state 项目 {project_name!r} 的 files 必须是 JSON 对象")
+        for arch, rel in files.items():
+            if (not isinstance(arch, str)
+                    or PATH_PART_RE.fullmatch(arch) is None):
+                raise StateError(
+                    f"state 项目 {project_name!r} 的架构键不安全: {arch!r}")
+            if not _is_safe_repo_deb_path(st, rel):
+                raise StateError(
+                    f"state 项目 {project_name!r} 的文件路径不安全: {rel!r}")
+    return raw
+
+
 def load_state(st, strict=False):
     """读 state.json。
 
@@ -1123,8 +1290,15 @@ def load_state(st, strict=False):
                 f"为免误删整个仓库,拒绝继续。确认要重建的话,请先备份 pool,"
                 f"再用 sync 重新收录(或临时把该文件写成 {{}})。")
         return {}
+    except (OSError, UnicodeError) as e:
+        if strict:
+            raise StateError(
+                f"state 文件无法读取: {st.state_file} ({e})。"
+                f"为免误删整个仓库,拒绝继续。请检查权限或从备份恢复。")
+        print(f"警告: state 文件无法读取({e}),按空状态处理", file=sys.stderr)
+        return {}
     try:
-        return json.loads(text)
+        raw = json.loads(text)
     except json.JSONDecodeError as e:
         if strict:
             raise StateError(
@@ -1132,13 +1306,18 @@ def load_state(st, strict=False):
                 f"为免误删整个仓库,拒绝继续。可从备份恢复,或用 sync 重新收录。")
         print(f"警告: state 文件无法解析({e}),按空状态处理", file=sys.stderr)
         return {}
+    try:
+        return _validate_state(st, raw)
+    except StateError as e:
+        if strict:
+            raise
+        print(f"警告: state 文件结构无效({e}),按空状态处理", file=sys.stderr)
+        return {}
 
 
 def save_state(st, state):
-    st.state_file.parent.mkdir(parents=True, exist_ok=True)
-    tmp = st.state_file.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n")
-    os.replace(tmp, st.state_file)
+    atomic_write_text(
+        st.state_file, json.dumps(state, indent=2, ensure_ascii=False) + "\n")
 
 
 # ── 子命令 ────────────────────────────────────────────────────────────
@@ -1196,8 +1375,14 @@ def cmd_sync(args):
         cache = load_hash_cache(st)
         for rel in touched:
             cache.pop(rel, None)   # 刚被覆盖写的文件,缓存一律作废后重算
-        prune = prune_candidates(st)
-        dist, index_files, release_data = generate_indexes(st, exclude=prune, cache=cache)
+        try:
+            prune = prune_candidates(st)
+            dist, index_files, release_data = generate_indexes(
+                st, exclude=prune, cache=cache)
+        except Exception as e:
+            print(f"[fail] 生成索引失败,未发布仓库: {e}", file=sys.stderr)
+            save_hash_cache(st, cache)
+            sys.exit(1)
         try:
             publish_if_needed(st, dist, index_files, release_data, args.force)
         except Exception as e:
@@ -1308,8 +1493,14 @@ def cmd_gc(args):
         if victims:
             # 与 sync 相同的顺序:先发布"把这些包排除掉"的索引,成功后再删文件。
             doomed = [p for d in victims for p in d.glob("*.deb")]
-            dist, index_files, release_data = generate_indexes(
-                st, exclude=doomed, cache=cache)
+            try:
+                dist, index_files, release_data = generate_indexes(
+                    st, exclude=doomed, cache=cache)
+            except Exception as e:
+                print(f"[gc] 生成索引失败,未删除任何文件: {e}",
+                      file=sys.stderr)
+                save_hash_cache(st, cache)
+                sys.exit(1)
             try:
                 publish_if_needed(st, dist, index_files, release_data)
             except Exception as e:

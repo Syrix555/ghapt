@@ -27,8 +27,12 @@
 - 拒绝多个资产架构映射到同一个 pool 文件，并在底层收录路径再次校验 Debian 版本。
 - `index_matches()` 验证 `Release.gpg`、`InRelease`、签名指纹和 InRelease 解出的 `Release` 内容。
 - `publish()` 在 staging 树中生成索引、签名和公钥，切换失败时恢复旧发布树并清理临时目录。
+- 严格校验 `state.json` 和 `index-cache.json` 的结构、路径和摘要字段。
+- 预发布 release 跟随 GitHub `Link` 分页，配置语法错误和损坏 deb 转换为可控失败。
+- 限制路径组成部分、隔离 component、校验 pool deb 文件名，并使用唯一临时文件原子写入状态和缓存。
 
 新增的 `tests/test_high_priority.py` 覆盖上述修复和重复 pool 目标边界，共 7 项回归测试；`tests/scenario_1_happy.py` 也检查第二次 `sync` 的退出码。
+新增的 `tests/test_medium_priority.py` 覆盖中优先级修复，共 6 项回归测试。
 
 ## 验证范围和限制
 
@@ -36,9 +40,12 @@
 
 ```text
 python3 -m py_compile ghapt.py tests/*.py
+python3 -m unittest -v tests.test_high_priority
+python3 -m unittest -v tests.test_medium_priority
+git diff --check
 ```
 
-语法检查通过。
+语法检查、两组回归测试和 diff 检查均通过：高优先级 `7/7`，中优先级 `6/6`。
 
 完整测试当前结果为 `36 PASS / 19 FAIL`，且只有 `5/6` 个场景正常返回。失败的共同根因是当前 Codex 沙箱无法让 GnuPG agent 绑定 Unix socket：
 
@@ -100,7 +107,7 @@ gpg: can't connect to the agent
 
 ## 中优先级问题
 
-### P2：state.json 只检查 JSON 语法，不检查结构
+### P2：state.json 只检查 JSON 语法，不检查结构（已修复）
 
 以下内容可能被接受并在后续流程中触发异常或错误状态：
 
@@ -116,53 +123,63 @@ null
 {"project": {"files": []}}
 ```
 
-应校验顶层、项目记录、`tag`、`files`、架构键和仓库内相对路径的类型与格式。
+修复结果：严格模式要求顶层为对象，项目记录、`tag`、`files`、架构键和文件路径均通过结构及路径校验；路径必须是仓库内 `pool/` 下的 `.deb` 文件。普通同步模式遇到损坏状态时给出警告并按空状态处理，`check`/`gc` 等严格流程继续拒绝执行。
 
-### P2：损坏的 index-cache 可能 traceback 或污染索引
+### P2：损坏的 index-cache 可能 traceback 或污染索引（已修复）
 
 缓存顶层为 `[]` 或 `null` 时会在 `.items()` 处抛异常。当前只检查值是长度为 5 的 list，不检查 size、mtime、摘要长度和十六进制格式。伪造 size/mtime 可能使错误摘要直接进入 Packages 和 Release。
 
-应对缓存逐条严格验证，异常条目丢弃，顶层非 dict 退化为空缓存。
+修复结果：缓存顶层非对象时退化为空缓存，并逐条检查路径、size、mtime、MD5、SHA1 和 SHA256 的类型、范围及格式；非法条目被丢弃，命中缓存前再次验证条目结构。
 
-### P2：预发布模式只读取 GitHub 前 10 个 release
+### P2：预发布模式只读取 GitHub 前 10 个 release（已修复）
 
 请求使用 `per_page=10`，没有处理 GitHub Link 分页。如果前 10 个都是 draft 或不符合条件，而第 11 个才是可用 release，会错误报告没有 release。
 
-应循环处理分页，直到找到可用 release 或确认列表结束。
+修复结果：解析 GitHub `Link` 响应头并跟随 `rel="next"`，直到找到非 draft release 或确认分页结束。
 
-### P2：配置解析异常没有转换成可控错误
+### P2：配置解析异常没有转换成可控错误（已修复）
 
 `ConfigParser.read()` 及相关解析过程没有完整捕获 `configparser.Error`。语法错误、缺少 section、重复 section 或重复 option 可能直接 traceback。
 
-应转换为清晰的配置错误和稳定的非零退出码。
+修复结果：捕获 `configparser.Error` 和 UTF-8 解码错误，转换为带配置文件路径的稳定错误和非零退出码。
 
-### P2：pool 中损坏的 deb 会导致 traceback
+### P2：pool 中损坏的 deb 会导致 traceback（已修复）
 
 `generate_indexes()` 扫描 pool 后直接读取每个 `.deb` 的 control 信息。损坏包会抛异常，且该过程发生在发布异常处理之前，可能把用户带入 traceback。
 
-应报告具体路径并阻止发布，确保错误可控。
+修复结果：索引生成捕获 deb 读取和哈希异常，错误中包含具体路径；`sync`/`gc` 在发布或删除前停止并返回非零，不产生未处理 traceback。
 
-### P2：路径组成部分缺少安全校验
+### P2：路径组成部分缺少安全校验（已修复）
 
 `component`、`suite`、项目包名和架构等值参与路径拼接，没有限制绝对路径、`..` 和路径分隔符。已用 `component = ../../outside` 复现仓库目录外写入风险。
 
-应限制为安全的单一路径组成部分，并对最终路径 `resolve()` 后确认仍在 `repo_dir` 内。
+修复结果：`suite`、`component`、`package`、架构键等配置值限制为安全的单一路径组成部分，pool 和状态/缓存路径还会在解析后确认位于仓库范围内。
 
-### P2：切换 component 后旧 component 会污染新索引
+### P2：切换 component 后旧 component 会污染新索引（已修复）
 
 索引生成扫描整个 `repo/pool`，但索引路径使用当前 component。配置从一个 component 切换到另一个后，旧 component 的 deb 可能进入新 component 的 Packages，而 Filename 仍指向旧 component。
 
-应只扫描当前 component，或在配置迁移时明确处理旧 component。
+修复结果：索引生成和清理计划只扫描当前配置的 `pool/<component>`，旧 component 的包不会进入新 component 的索引，也不会被当前 component 的清理逻辑误删。
+
+### P2：异常命名的 pool deb 可能导致清理阶段崩溃（已修复）
+
+`prune_pool_plan()` 和 `prune_candidates()` 原先通过字符串切分推断版本和架构。pool 中出现命名异常的 `.deb` 时，清理逻辑可能抛出 `IndexError`，并且错误不指向具体文件。
+
+修复结果：统一解析 `<package>_<version>_<architecture>.deb`，校验包名、架构和 Debian 版本；异常文件会阻止清理并报告具体路径。
+
+### P2：状态和缓存写入使用固定临时文件（已修复）
+
+`state.json` 和 `index-cache.json` 原先使用固定的 `.tmp` 文件名。外部并发进程或残留临时文件可能互相覆盖，写入中断也可能留下不完整文件。
+
+修复结果：使用同目录唯一临时文件，写入并 `fsync()` 后通过 `os.replace()` 原子替换；异常时清理临时文件。
 
 ## 其他风险和改进项
 
 - 发布索引后删除旧版本或保存 state 失败，可能导致状态文件与实际 pool 不一致。
 - Release 的 Origin、Label、Description 等元数据变化不会单独触发重发布。
 - `ghapt.gpg` 或 `ghapt.asc` 被删除/损坏时，如果索引仍匹配，普通 sync 不会重新导出公钥。
-- `save_state()` 和 `save_hash_cache()` 使用固定临时文件名，外部并发进程可能互相覆盖。
 - 仅使用 mtime 和 size 的缓存无法检测同大小且 mtime 恰好相同的内容替换。
 - suite 修改后旧的 `dists/<old-suite>` 不会自动删除。
-- `prune_pool_plan()` 对异常命名的 `.deb` 可能抛 `IndexError`。
 - `place_deb()` 写入临时文件时若中途异常，清理依赖后续流程，应显式清理。
 - `ensure_key()` 只选第一个 secret key，没有确认它对应配置的 key name/email，也没有检查签名能力。
 - `setup.sh` 将可能包含 token 的配置安装为 `0644`，同机其他用户可读取。
@@ -184,14 +201,8 @@ null
 - 预发布 tag 使用 Debian `~` 语义。
 - `strip_prefix` 不匹配时明确报错。
 
-## 后续修复顺序
+## 后续工作
 
-下一轮可以继续处理：
+剩余风险主要集中在发布后 state/pool 的故障恢复、缓存的极端碰撞、旧 suite 清理、公钥选择与能力校验、pool 临时文件清理，以及 `setup.sh` 的配置权限。完整端到端 GPG 测试仍需要具备可用 Unix socket 的环境；当前沙箱限制已在“验证范围和限制”中记录。
 
-1. 加强 state/cache JSON 结构校验。
-2. 捕获配置解析异常，并把损坏 deb 转换为可控错误。
-3. 实现预发布 release 分页。
-4. 完善 component、suite、package 等路径边界和 component 隔离。
-5. 在具备可用 GPG agent 的环境中重新运行完整端到端测试。
-
-本轮已修改 `ghapt.py`、`tests/test_high_priority.py`、`tests/scenario_1_happy.py` 和本审查文档；完整端到端 GPG 测试仍受当前沙箱限制。
+本轮已修改 `ghapt.py`、新增 `tests/test_medium_priority.py` 并更新本审查文档；未创建 commit。
