@@ -1,0 +1,15 @@
+# Git metadata lives here because the mounted .git directory is read-only.
+.git-meta/
+
+# Test and Python-generated files.
+tests/logs/
+tests/work/
+__pycache__/
+tests/__pycache__/
+*.pyc
+
+# Local runtime state and generated repository data.
+index-cache.json
+state.json
+*.lock
+*.tmp

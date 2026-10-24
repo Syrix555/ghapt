@@ -1,0 +1,36 @@
+[Unit]
+Description=ghapt: sync GitHub releases into the APT repo
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ghapt
+Group=ghapt
+EnvironmentFile=-/etc/ghapt/env
+ExecStart=/usr/bin/python3 /opt/ghapt/ghapt.py sync -c /etc/ghapt/config.ini
+Nice=10
+
+# ── 沙箱加固:除 /srv/ghapt 外整个文件系统只读 ──
+# 注意:gpg 签名要经 unix socket 联系 gpg-agent,RestrictAddressFamilies 里不能去掉 AF_UNIX
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/srv/ghapt
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0022

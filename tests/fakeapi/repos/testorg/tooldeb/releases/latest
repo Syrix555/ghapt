@@ -1,0 +1,14 @@
+{
+  "tag_name": "v1.0.0",
+  "draft": false,
+  "prerelease": false,
+  "created_at": "2026-01-01T00:00:00Z",
+  "assets": [
+    {
+      "name": "tooldeb_1.0.0_amd64.deb",
+      "size": 772,
+      "browser_download_url": "file:///home/syrix/ghapt/tests/assets/tooldeb_1.0.0_amd64.deb",
+      "digest": "sha256:08d142c3c7dc937a7897e73e24c27e2d9c2c3000866d92325dfde76dcf774dfe"
+    }
+  ]
+}

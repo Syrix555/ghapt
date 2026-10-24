@@ -1,0 +1,14 @@
+{
+  "tag_name": "v1.2.3",
+  "draft": false,
+  "prerelease": false,
+  "created_at": "2026-01-01T00:00:00Z",
+  "assets": [
+    {
+      "name": "toolbin_1.2.3_linux_x86_64.tar.gz",
+      "size": 9796,
+      "browser_download_url": "file:///home/syrix/ghapt/tests/assets/toolbin_1.2.3_linux_x86_64.tar.gz",
+      "digest": "sha256:15ba8b28eb8d32411963ee2b085b40a5e73a0c2940a0ed6b03fa8c2e6b9c0ed6"
+    }
+  ]
+}

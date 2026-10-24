@@ -1,0 +1,11 @@
+[Unit]
+Description=ghapt daily sync timer
+
+[Timer]
+# 每天凌晨 04:12 左右同步一次;要改频率就改这里,比如 OnCalendar=*-*-* 04,16:12:00 一天两次
+OnCalendar=*-*-* 04:12:00
+RandomizedDelaySec=45min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
