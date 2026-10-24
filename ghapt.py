@@ -547,27 +547,132 @@ def prune_candidates(st):
     return out
 
 
-def place_deb(deb: Path, st: Settings):
-    """把 deb 收进 pool(以 control 里的字段为准命名),返回 (是否有变化, 相对路径)。
+def _path_part(value, label):
+    """Validate a value that is used as one directory or file-name component."""
+    if (not isinstance(value, str) or not value or value in (".", "..")
+            or os.path.isabs(value) or "/" in value or "\\" in value):
+        raise RuntimeError(f"{label} 不是安全的单一路径组成部分: {value!r}")
+    return value
 
-    注意这里**不清理旧版本**:删文件必须发生在新索引发布成功之后(见 cmd_sync),
-    否则发布一旦失败,就会留下"索引还列着、文件已被删"的 404 状态。
-    """
-    _, d = deb_control(deb)
-    pkg, ver, arch = d["Package"], d["Version"], d["Architecture"]
-    pooldir = st.repo_dir / "pool" / st.component / pkg[0].lower() / pkg
-    pooldir.mkdir(parents=True, exist_ok=True)
+
+def _pool_target(st, metadata):
+    pkg = _path_part(metadata["Package"], "Package")
+    ver = metadata["Version"]
+    if not isinstance(ver, str) or not valid_version(ver):
+        raise RuntimeError(f"Version 不是合法 Debian 版本: {ver!r}")
+    arch = _path_part(metadata["Architecture"], "Architecture")
+    component = _path_part(st.component, "component")
+    pooldir = st.repo_dir / "pool" / component / pkg[0].lower() / pkg
     target = pooldir / f"{pkg}_{ver.replace(':', '%3a')}_{arch}.deb"
-    rel = target.relative_to(st.repo_dir).as_posix()
-    if target.exists() and file_hashes(target)[3] == file_hashes(deb)[3]:
-        return False, rel
-    # 原子写:先写临时文件再 rename。直接 copy2 覆盖同名文件是原地截断,
-    # 若这个版本号的内容变了(例如上游重发了同版本号),并发下载的客户端
-    # 可能读到写了一半的文件。索引层一直是"先 .new 再 os.replace",这里对齐。
-    tmp = target.with_name(target.name + ".new")
-    shutil.copy2(deb, tmp)
-    os.replace(tmp, target)
-    return True, rel
+    root = st.repo_dir.resolve()
+    if root not in target.resolve().parents:
+        raise RuntimeError(f"deb 目标路径超出仓库目录: {target}")
+    return target, target.relative_to(st.repo_dir).as_posix()
+
+
+def validate_deb_metadata(deb, project, asset_arch, expected_version=None):
+    """Check that an incoming deb belongs to the configured project."""
+    try:
+        _, metadata = deb_control(deb)
+    except (KeyError, RuntimeError) as e:
+        raise RuntimeError(f"无法读取 deb 元数据 {deb.name}: {e}") from e
+    for field in ("Package", "Version", "Architecture"):
+        if not metadata.get(field):
+            raise RuntimeError(f"{deb.name} 缺少 control 字段 {field}")
+    if metadata["Package"] != project.package:
+        raise RuntimeError(
+            f"{deb.name} 的 Package={metadata['Package']!r},"
+            f"配置期望 {project.package!r}")
+    if metadata["Architecture"] not in (asset_arch, "all"):
+        raise RuntimeError(
+            f"{deb.name} 的 Architecture={metadata['Architecture']!r},"
+            f"资产架构键期望 {asset_arch!r} (允许 all)")
+    if not valid_version(metadata["Version"]):
+        raise RuntimeError(
+            f"{deb.name} 的 Version={metadata['Version']!r} 不是合法 Debian 版本")
+    if expected_version is not None and metadata["Version"] != expected_version:
+        raise RuntimeError(
+            f"{deb.name} 的 Version={metadata['Version']!r},"
+            f"重打包期望 {expected_version!r}")
+    return metadata
+
+
+def _stage_and_commit_debs(st, entries):
+    """Stage every deb for a project, then commit all pool files as one unit."""
+    st.repo_dir.mkdir(parents=True, exist_ok=True)
+    stage_root = Path(tempfile.mkdtemp(prefix=".ghapt-project-", dir=str(st.repo_dir)))
+    records = []
+    committed = []
+    targets = {}
+    try:
+        for arch, deb, metadata in entries:
+            target, rel = _pool_target(st, metadata)
+            if target in targets:
+                previous_arch = targets[target]
+                raise RuntimeError(
+                    f"多个资产架构({previous_arch}、{arch})映射到同一个 pool 文件: {rel}")
+            targets[target] = arch
+            staged = stage_root / rel
+            staged.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(deb, staged)
+            records.append((arch, staged, target, rel))
+
+        # Prepare all backups before changing pool. If a copy fails, no target
+        # has been changed yet.
+        backup_root = stage_root / ".backups"
+        backup_root.mkdir()
+        backups = {}
+        changes = {}
+        for arch, staged, target, rel in records:
+            same = target.exists() and file_hashes(target)[3] == file_hashes(staged)[3]
+            changes[arch] = not same
+            if same:
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.exists():
+                backup = backup_root / rel
+                backup.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(target, backup)
+                backups[target] = backup
+
+        try:
+            for record in records:
+                arch, staged, target, rel = record
+                if changes[arch]:
+                    os.replace(staged, target)
+                    committed.append((target, backups.get(target)))
+        except BaseException as e:
+            rollback_errors = []
+            for target, backup in reversed(committed):
+                try:
+                    if backup is not None and backup.exists():
+                        os.replace(backup, target)
+                    else:
+                        target.unlink(missing_ok=True)
+                except OSError as rollback_error:
+                    rollback_errors.append(f"{target}: {rollback_error}")
+            if rollback_errors:
+                raise RuntimeError(
+                    f"pool 提交失败且回滚也失败: {e}; "
+                    f"{'; '.join(rollback_errors)}") from e
+            raise
+
+        return changes, {arch: rel for arch, _staged, _target, rel in records}
+    finally:
+        shutil.rmtree(stage_root, ignore_errors=True)
+
+
+def place_deb(deb: Path, st: Settings, project=None, asset_arch=None,
+              expected_version=None):
+    """把一个 deb 收进 pool(兼容旧调用方,项目同步使用批量提交)。"""
+    _, metadata = deb_control(deb)
+    if project is not None:
+        if asset_arch is None:
+            raise ValueError("asset_arch is required when project is supplied")
+        validate_deb_metadata(deb, project, asset_arch, expected_version)
+    changes, paths = _stage_and_commit_debs(st, [(asset_arch, deb, metadata)])
+    arch = asset_arch if asset_arch is not None else metadata["Architecture"]
+    return changes[arch], paths[arch]
 
 
 # ── 同步单个项目 ──────────────────────────────────────────────────────
@@ -580,7 +685,7 @@ def sync_project(project, st, state, force):
         (st.repo_dir / f).exists() for f in prev["files"].values())
     if not force and prev.get("tag") == tag and files_ok:
         print(f"[ok] {project.name}: 已是最新 ({tag})")
-        return False
+        return []
 
     assets = rel.get("assets", [])
     picked = {}
@@ -593,7 +698,8 @@ def sync_project(project, st, state, force):
                 f"该 release 的资产列表:\n    {names}")
         picked[arch] = matches[0]
 
-    version = deb_version_from_tag(tag, project.strip_prefix, project.name)
+    version = (deb_version_from_tag(tag, project.strip_prefix, project.name)
+               if project.type == "binary" else None)
     with tempfile.TemporaryDirectory(prefix="ghapt-") as tmp:
         tmpdir = Path(tmp)
         # 两阶段:先把该项目的所有架构都下载/打包成功,再动 pool。
@@ -610,12 +716,15 @@ def sync_project(project, st, state, force):
             download(asset["browser_download_url"], dest, asset.get("size"), digest)
             deb = dest if project.type == "deb" else build_deb(
                 project, version, arch, dest, tmpdir, st)
-            deb_control(deb)   # 立刻校验:坏包必须在动 pool 之前就失败
-            staged.append((arch, deb))
+            metadata = validate_deb_metadata(
+                deb, project, arch, expected_version=version)
+            staged.append((arch, deb, metadata))
 
+        changed_by_arch, relpaths = _stage_and_commit_debs(st, staged)
         changed, new_files, touched = False, {}, []
-        for arch, deb in staged:
-            c, relpath = place_deb(deb, st)
+        for arch, _deb, _metadata in staged:
+            c = changed_by_arch[arch]
+            relpath = relpaths[arch]
             changed |= c
             new_files[arch] = relpath
             if c:
@@ -746,21 +855,88 @@ def generate_indexes(st, exclude=(), cache=None):
 
 
 def parse_release_hashes(text):
-    """解析 Release 的 MD5Sum/SHA1/SHA256 段 → {(字段, 相对路径): (hexdigest, size)}"""
+    """解析 Release 的 MD5Sum/SHA1/SHA256 段。
+
+    返回 {(字段, 相对路径): (hexdigest, size)}。哈希段里出现坏行时
+    直接报错,由调用方把它当成"需要重建",而不是让异常穿透到 CLI。
+    """
     out, field = {}, None
+    lengths = {"MD5Sum": 32, "SHA1": 40, "SHA256": 64}
     for line in text.splitlines():
         if not line.startswith((" ", "\t")):
             field = line[:-1] if line.endswith(":") else None
             continue
-        if field not in ("MD5Sum", "SHA1", "SHA256"):
+        if field not in lengths:
             continue
         parts = line.split()
-        if len(parts) == 3:
-            out[(field, parts[2])] = (parts[0], int(parts[1]))
+        if len(parts) != 3:
+            raise ValueError(f"{field} 段包含格式错误的行")
+        digest, raw_size, rel = parts
+        if (len(digest) != lengths[field]
+                or re.fullmatch(r"[0-9a-fA-F]+", digest) is None):
+            raise ValueError(f"{field} 段包含格式错误的摘要")
+        try:
+            size = int(raw_size)
+        except ValueError as e:
+            raise ValueError(f"{field} 段包含非整数文件大小") from e
+        if size < 0 or not rel or Path(rel).is_absolute():
+            raise ValueError(f"{field} 段包含格式错误的文件路径或大小")
+        out[(field, rel)] = (digest.lower(), size)
     return out
 
 
-def index_matches(dist, index_files):
+def _gpg_status_fingerprint(status):
+    """Extract the signature and primary-key fingerprints from gpg status."""
+    for line in status.splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[0] == "[GNUPG:]" and parts[1] == "VALIDSIG":
+            candidates = [parts[2]]
+            if len(parts) >= 12:
+                candidates.append(parts[-1])
+            return {value.lower() for value in candidates if value}
+    return set()
+
+
+def _verify_detached_signature(st, fpr, signature, signed):
+    keyring = st.repo_dir / "ghapt.gpg"
+    if not keyring.is_file():
+        return False, "缺少 ghapt.gpg 公钥"
+    proc = subprocess.run(
+        ["gpg", "--batch", "--no-default-keyring", "--keyring", str(keyring),
+         "--status-fd", "1", "--verify", str(signature), str(signed)],
+        capture_output=True, text=True, env=gpg_env(st))
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        return False, f"Release.gpg 签名无效{': ' + detail if detail else ''}"
+    if fpr.lower() not in _gpg_status_fingerprint(proc.stdout):
+        return False, "Release.gpg 不是当前仓库密钥签名"
+    return True, ""
+
+
+def _verify_inrelease_signature(st, fpr, inrelease, release):
+    keyring = st.repo_dir / "ghapt.gpg"
+    if not keyring.is_file():
+        return False, "缺少 ghapt.gpg 公钥"
+    proc = subprocess.run(
+        ["gpg", "--batch", "--no-default-keyring", "--keyring", str(keyring),
+         "--status-fd", "2", "--output", "-", "--decrypt", str(inrelease)],
+        capture_output=True, env=gpg_env(st))
+    status = (proc.stderr or b"").decode("utf-8", "replace")
+    if proc.returncode != 0:
+        detail = status.strip()
+        return False, f"InRelease 签名无效{': ' + detail if detail else ''}"
+    if fpr.lower() not in _gpg_status_fingerprint(status):
+        return False, "InRelease 不是当前仓库密钥签名"
+    try:
+        release_bytes = release.read_bytes()
+    except OSError as e:
+        return False, f"Release 不可读: {e}"
+    if proc.stdout != release_bytes:
+        return False, "InRelease 解出的 Release 内容不一致"
+    return True, ""
+
+
+def index_matches(dist, index_files, st=None, fpr=None):
     """已发布的索引,是否与"当前 pool 生成的索引"完全一致?返回 (是否一致, 原因)。
 
     比较两件事:索引文件本身的字节,以及 Release 里对它们的哈希声明。
@@ -780,7 +956,7 @@ def index_matches(dist, index_files):
             want[(field, rel)] = (hasher(data).hexdigest(), len(data))
     try:
         have = parse_release_hashes((dist / "Release").read_text())
-    except OSError as e:
+    except (OSError, UnicodeError, ValueError) as e:
         return False, f"Release 不可读: {e}"
     if have != want:
         return False, "Release 声明的哈希与 pool 当前内容不一致"
@@ -790,6 +966,19 @@ def index_matches(dist, index_files):
                 return False, f"索引文件内容不一致: {rel}"
         except OSError as e:
             return False, f"索引文件不可读: {rel} ({e})"
+    if st is None or not fpr:
+        return False, "无法验证索引签名: 未提供仓库密钥"
+    for name in ("ghapt.gpg", "ghapt.asc"):
+        if not (st.repo_dir / name).is_file():
+            return False, f"无法验证签名: 缺少公钥 {name}"
+    ok, why = _verify_detached_signature(
+        st, fpr, dist / "Release.gpg", dist / "Release")
+    if not ok:
+        return False, why
+    ok, why = _verify_inrelease_signature(
+        st, fpr, dist / "InRelease", dist / "Release")
+    if not ok:
+        return False, why
     return True, ""
 
 
@@ -827,35 +1016,90 @@ def ensure_key(st):
 
 
 def publish(st, fpr, dist, index_files, release_data):
-    """全部先写成 *.new,签好名后再逐个原子替换:索引 → Release → Release.gpg → InRelease。
-    InRelease 放最后,避免客户端在重写中途拿到新旧不配套的文件报 Hash Sum mismatch。"""
+    """构建完整发布树后整体切换,失败时恢复旧树和公钥。
+
+    Unix 无法把一个非空目录直接替换到另一个非空目录,所以提交协议是:
+    旧 dist 改名到备份 -> 新 dist 改名到正式位置 -> 原子替换两个公钥。
+    任一步失败都尽力撤销已经完成的步骤,并把回滚失败明确报告出来。
+    """
     env = gpg_env(st)
-    ordered = []
-    for rel, data in sorted(index_files.items()):
-        final = dist / rel
-        final.parent.mkdir(parents=True, exist_ok=True)
-        new = Path(str(final) + ".new")
-        new.write_bytes(data)
-        ordered.append((new, final))
+    st.repo_dir.mkdir(parents=True, exist_ok=True)
+    dist.parent.mkdir(parents=True, exist_ok=True)
+    publish_root = Path(tempfile.mkdtemp(
+        prefix=".ghapt-publish-", dir=str(st.repo_dir)))
+    new_dist = publish_root / "dist"
+    new_dist.mkdir()
+    key_stage = publish_root / "keys"
+    key_stage.mkdir()
+    backup_dist = publish_root / "old-dist"
+    backup_keys = {name: publish_root / f"old-{name}"
+                   for name in ("ghapt.asc", "ghapt.gpg")}
+    key_paths = {name: st.repo_dir / name
+                 for name in ("ghapt.asc", "ghapt.gpg")}
+    installed_keys = set()
+    dist_installed = False
+    dist_backed_up = False
+    key_backups = set()
 
-    release_new = Path(str(dist / "Release") + ".new")
-    release_new.write_bytes(release_data)
-    inrelease_new = Path(str(dist / "InRelease") + ".new")
-    sig_new = Path(str(dist / "Release.gpg") + ".new")
-    run_checked(["gpg", "--batch", "--yes", "-u", fpr, "--digest-algo", "SHA256",
-                 "--clearsign", "-o", str(inrelease_new), str(release_new)], env=env)
-    run_checked(["gpg", "--batch", "--yes", "-u", fpr, "--digest-algo", "SHA256",
-                 "-abs", "-o", str(sig_new), str(release_new)], env=env)
-    ordered += [(release_new, dist / "Release"),
-                (sig_new, dist / "Release.gpg"),
-                (inrelease_new, dist / "InRelease")]
-    for new, final in ordered:
-        os.replace(new, final)
+    try:
+        for rel, data in sorted(index_files.items()):
+            final = new_dist / rel
+            final.parent.mkdir(parents=True, exist_ok=True)
+            final.write_bytes(data)
+        release = new_dist / "Release"
+        release.write_bytes(release_data)
+        inrelease = new_dist / "InRelease"
+        signature = new_dist / "Release.gpg"
+        run_checked(["gpg", "--batch", "--yes", "-u", fpr,
+                     "--digest-algo", "SHA256", "--clearsign",
+                     "-o", str(inrelease), str(release)], env=env)
+        run_checked(["gpg", "--batch", "--yes", "-u", fpr,
+                     "--digest-algo", "SHA256", "-abs",
+                     "-o", str(signature), str(release)], env=env)
 
-    for name, opts in (("ghapt.asc", ["--armor"]), ("ghapt.gpg", [])):
-        data = run_checked(["gpg", "--batch", "--export", *opts, fpr],
-                           binary=True, env=env).stdout
-        (st.repo_dir / name).write_bytes(data)
+        for name, opts in (("ghapt.asc", ["--armor"]), ("ghapt.gpg", [])):
+            data = run_checked(["gpg", "--batch", "--export", *opts, fpr],
+                               binary=True, env=env).stdout
+            if not isinstance(data, bytes) or not data:
+                raise RuntimeError(f"gpg --export 没有生成 {name}")
+            (key_stage / name).write_bytes(data)
+
+        if dist.exists():
+            os.replace(dist, backup_dist)
+            dist_backed_up = True
+        os.replace(new_dist, dist)
+        dist_installed = True
+
+        for name, final in key_paths.items():
+            old = backup_keys[name]
+            if final.exists():
+                os.replace(final, old)
+                key_backups.add(name)
+            os.replace(key_stage / name, final)
+            installed_keys.add(name)
+    except Exception as e:
+        rollback_errors = []
+        for name in reversed(("ghapt.gpg", "ghapt.asc")):
+            final = key_paths[name]
+            try:
+                if name in installed_keys:
+                    final.unlink(missing_ok=True)
+                if name in key_backups:
+                    os.replace(backup_keys[name], final)
+            except OSError as rollback_error:
+                rollback_errors.append(f"{final}: {rollback_error}")
+        try:
+            if dist_installed and dist.exists():
+                shutil.rmtree(dist)
+            if dist_backed_up and backup_dist.exists():
+                os.replace(backup_dist, dist)
+        except OSError as rollback_error:
+            rollback_errors.append(f"{dist}: {rollback_error}")
+        suffix = (f"; 回滚也失败: {'; '.join(rollback_errors)}"
+                  if rollback_errors else "; 已恢复旧发布内容")
+        raise RuntimeError(f"publish 失败: {e}{suffix}") from e
+    finally:
+        shutil.rmtree(publish_root, ignore_errors=True)
 
 
 # ── 状态文件 ──────────────────────────────────────────────────────────
@@ -901,12 +1145,15 @@ def save_state(st, state):
 
 def publish_if_needed(st, dist, index_files, release_data, force=False):
     """索引与 pool 一致就什么都不做,否则签名发布。返回是否真的发布了。"""
-    ok, why = index_matches(dist, index_files)
+    fpr = None
+    if (dist / "Release").is_file():
+        fpr = ensure_key(st)
+    ok, why = index_matches(dist, index_files, st=st, fpr=fpr)
     if ok and not force:
         print("[done] 索引与 pool 一致,未改动。")
-        return False
+        return []
     print(f"    索引需要重建:{why}" if not ok else "    按 --force 要求重建索引")
-    fpr = ensure_key(st)
+    fpr = fpr or ensure_key(st)
     publish(st, fpr, dist, index_files, release_data)
     print(f"[done] 仓库索引已更新并签名 ({st.repo_dir})")
     return True

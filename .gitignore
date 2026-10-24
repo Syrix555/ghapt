@@ -1,6 +1,3 @@
-# Git metadata lives here because the mounted .git directory is read-only.
-.git-meta/
-
 # Test and Python-generated files.
 tests/logs/
 tests/work/

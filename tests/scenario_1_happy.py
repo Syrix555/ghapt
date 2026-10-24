@@ -123,6 +123,7 @@ def main():
     before, mtime = inrelease(env).read_bytes(), inrelease(env).stat().st_mtime
     r = sync(cfg)
     print("  " + r.out.strip().replace("\n", "\n  "))
+    c.check("第二次 sync 退出码仍为 0", r.code == 0, f"exit={r.code}")
     c.check("两个项目都报 '已是最新'", r.out.count("已是最新") == 2)
     c.check("InRelease 字节与 mtime 均未变(真幂等)",
             inrelease(env).read_bytes() == before and inrelease(env).stat().st_mtime == mtime)
