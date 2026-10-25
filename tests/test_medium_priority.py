@@ -1,4 +1,5 @@
 import json
+import io
 import shutil
 import tempfile
 import unittest
@@ -24,6 +25,8 @@ class MediumPriorityTests(unittest.TestCase):
             origin="ghapt",
             label="ghapt",
             description="test repository",
+            token="",
+            github_mirror="",
         )
 
     def tearDown(self):
@@ -144,6 +147,132 @@ class MediumPriorityTests(unittest.TestCase):
             "/repos/o/r/releases?per_page=10",
             "https://api.github.com/repos/o/r/releases?page=2",
         ])
+
+    def test_github_mirror_rewrites_only_supported_https_hosts(self):
+        mirror = "https://gh.syrix.space/"
+        supported = (
+            "github.com",
+            "raw.githubusercontent.com",
+            "gist.githubusercontent.com",
+            "gist.github.com",
+            "api.github.com",
+            "codeload.github.com",
+            "github.githubassets.com",
+        )
+        for host in supported:
+            with self.subTest(host=host):
+                original = f"https://{host}/a/path?x=1"
+                self.assertEqual(
+                    ghapt.mirror_github_url(original, mirror),
+                    mirror.rstrip("/") + "/" + original,
+                )
+
+        self.assertEqual(
+            ghapt.mirror_github_url("http://github.com/a", mirror),
+            "http://github.com/a",
+        )
+        self.assertEqual(
+            ghapt.mirror_github_url("https://example.com/a", mirror),
+            "https://example.com/a",
+        )
+        self.assertEqual(
+            ghapt.mirror_github_url("file:///tmp/release.json", mirror),
+            "file:///tmp/release.json",
+        )
+        self.assertEqual(
+            ghapt.mirror_github_url("https://github.com/a", ""),
+            "https://github.com/a",
+        )
+
+    def test_github_mirror_config_is_validated_and_normalized(self):
+        config = self.root / "mirror.ini"
+        config.write_text(
+            "[settings]\n"
+            "architectures = amd64\n"
+            "github_mirror = https://gh.syrix.space/\n"
+        )
+        with mock.patch.dict("os.environ", {"GITHUB_MIRROR": ""}, clear=False):
+            st, _projects, _broken = ghapt.load_config(config)
+        self.assertEqual(st.github_mirror, "https://gh.syrix.space")
+
+        for value in (
+            "http://gh.syrix.space",
+            "gh.syrix.space",
+            "https://user@gh.syrix.space",
+            "https://gh.syrix.space/?token=secret",
+            "https://gh.syrix.space/#fragment",
+        ):
+            with self.subTest(value=value):
+                config.write_text(
+                    "[settings]\n"
+                    "architectures = amd64\n"
+                    f"github_mirror = {value}\n"
+                )
+                with self.assertRaisesRegex(SystemExit, "github_mirror"):
+                    ghapt.load_config(config)
+
+    def test_github_mirror_is_applied_to_api_requests(self):
+        class Response(io.BytesIO):
+            headers = {}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                self.close()
+
+        requests = []
+
+        def fake_urlopen(request, timeout):
+            requests.append((request, timeout))
+            return Response(b'{"tag_name": "v1", "assets": []}')
+
+        with mock.patch.object(
+            ghapt.urllib.request, "urlopen", side_effect=fake_urlopen
+        ):
+            result = ghapt.gh_json_response(
+                "/repos/o/r/releases/latest", "", "https://gh.syrix.space"
+            )
+
+        self.assertEqual(result[0]["tag_name"], "v1")
+        self.assertEqual(
+            requests[0][0].full_url,
+            "https://gh.syrix.space/https://api.github.com/repos/o/r/releases/latest",
+        )
+        self.assertEqual(requests[0][1], 60)
+
+    def test_github_mirror_is_applied_to_release_asset_download(self):
+        fixture = Path(__file__).parent / "assets" / "tooldeb_1.0.0_amd64.deb"
+        project = SimpleNamespace(
+            name="tool",
+            repo="o/r",
+            type="deb",
+            package="tooldeb",
+            assets={"amd64": r"^tooldeb"},
+            strip_prefix="v",
+        )
+        asset = {
+            "name": fixture.name,
+            "browser_download_url": "https://github.com/o/r/releases/download/v1/tool.deb",
+            "size": fixture.stat().st_size,
+        }
+        calls = []
+
+        def copy_fixture(url, dest, _size=None, _digest=None):
+            calls.append(url)
+            shutil.copy2(fixture, dest)
+
+        self.st.github_mirror = "https://gh.syrix.space"
+        with mock.patch.object(
+            ghapt, "latest_release",
+            return_value={"tag_name": "release-1", "assets": [asset]},
+        ), mock.patch.object(ghapt, "download", side_effect=copy_fixture):
+            ghapt.sync_project(project, self.st, {}, force=False)
+
+        self.assertEqual(
+            calls,
+            ["https://gh.syrix.space/https://github.com/o/r/releases/download/v1/tool.deb"],
+        )
 
     def test_generate_indexes_only_reads_the_configured_component(self):
         old = self.repo / "pool" / "oldcomp" / "t" / "tool"

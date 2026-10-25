@@ -14,6 +14,7 @@
 5b6b630 chore: establish audit baseline
 b6971ca fix: address high-priority repository consistency issues
 3f289b0 fix: complete medium-priority robustness fixes
+293683f fix: complete repository hardening and deployment safeguards
 ```
 
 本轮继续修复和文档同步没有创建 commit，用户可以在检查工作区后自行提交。
@@ -52,6 +53,7 @@ b6971ca fix: address high-priority repository consistency issues
 - `check` 在“有更新”和“查询失败”同时发生时返回查询失败码 2。
 - `ensure_key()` 校验配置 UID、指纹、有效期、撤销状态和签名能力。
 - `setup.sh` 将可能包含 token 的 `/etc/ghapt/config.ini` 和 `/etc/ghapt/env` 设置为 `ghapt:ghapt`、`0600`；递归修正 `/srv/ghapt` 所有权时不跟随内部符号链接；nginx 配置安装失败时统一回滚。
+- 可选 `github_mirror` 会把 API、分页和 release 资产 URL 改写到用户配置的 HTTPS 镜像；只改写明确支持的 GitHub 域名，并继续校验下载大小和 SHA256 digest。
 
 ## 测试结果
 
@@ -59,7 +61,7 @@ b6971ca fix: address high-priority repository consistency issues
 
 ```text
 python3 -m unittest -v tests.test_high_priority tests.test_medium_priority
-20 tests, OK
+24 tests, OK
 ```
 
 静态检查通过：

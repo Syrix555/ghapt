@@ -11,7 +11,7 @@
 用法:
   ghapt.py sync  [-c config.ini] [--project NAME] [--force]
   ghapt.py check [-c config.ini]
-  ghapt.py assets owner/repo [--prerelease]
+  ghapt.py assets owner/repo [--prerelease] [-c config.ini] [--mirror URL]
 """
 
 import argparse
@@ -37,9 +37,19 @@ from datetime import datetime, timezone
 from email.utils import parseaddr
 from functools import cmp_to_key
 from pathlib import Path, PurePosixPath
+from urllib.parse import urlsplit
 
 API_ROOT = "https://api.github.com"
 USER_AGENT = "ghapt/1.0"
+SUPPORTED_GITHUB_HOSTS = frozenset({
+    "github.com",
+    "raw.githubusercontent.com",
+    "gist.githubusercontent.com",
+    "gist.github.com",
+    "api.github.com",
+    "codeload.github.com",
+    "github.githubassets.com",
+})
 DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
           "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
@@ -87,6 +97,27 @@ def _config_email(value, label):
     return value
 
 
+def _config_github_mirror(value):
+    """Validate the HTTPS prefix used to proxy GitHub URLs."""
+    value = (value or "").strip()
+    if not value:
+        return ""
+    _config_single_line(value, "github_mirror")
+    try:
+        parsed = urlsplit(value)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError as e:
+        raise ConfigError(f"github_mirror 不是合法的 HTTPS URL: {value!r}") from e
+    if (parsed.scheme.lower() != "https" or not parsed.netloc
+            or not hostname or port is None and ":" in parsed.netloc
+            or parsed.username is not None or parsed.password is not None
+            or parsed.query or parsed.fragment):
+        raise ConfigError(
+            "github_mirror 必须是没有用户信息、查询参数或 fragment 的 HTTPS URL")
+    return value.rstrip("/")
+
+
 # ── 配置 ──────────────────────────────────────────────────────────────
 
 class ConfigError(ValueError):
@@ -122,6 +153,8 @@ class Settings:
             s.get("key_email", "ghapt@localhost"), "key_email")
         token = s.get("token", "") or os.environ.get("GITHUB_TOKEN", "")
         self.token = _config_single_line(token, "token", allow_empty=True)
+        mirror = s.get("github_mirror", "") or os.environ.get("GITHUB_MIRROR", "")
+        self.github_mirror = _config_github_mirror(mirror)
 
     @staticmethod
     def _int_setting(sec, key, default, minimum=None):
@@ -261,20 +294,38 @@ def with_retry(fn, attempts=3, delay=3):
         time.sleep(delay)
 
 
-def gh_json_response(path, token):
+def mirror_github_url(url, mirror=""):
+    """Prefix supported HTTPS GitHub URLs with a configured mirror."""
+    if not mirror:
+        return url
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return url
+    if (parsed.scheme.lower() != "https"
+            or parsed.hostname is None
+            or parsed.hostname.lower() not in SUPPORTED_GITHUB_HOSTS):
+        return url
+    return mirror.rstrip("/") + "/" + url
+
+
+def gh_json_response(path, token, mirror=""):
     headers = {"User-Agent": USER_AGENT, "Accept": "application/vnd.github+json"}
     if token:
         headers["Authorization"] = "Bearer " + token
 
     def go():
         url = path if "://" in path else API_ROOT + path
+        url = mirror_github_url(url, mirror)
         req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req, timeout=60) as resp:
             return json.load(resp), resp.headers
     return with_retry(go)
 
 
-def gh_json(path, token):
+def gh_json(path, token, mirror=""):
+    if mirror:
+        return gh_json_response(path, token, mirror)[0]
     return gh_json_response(path, token)[0]
 
 
@@ -287,13 +338,16 @@ def _next_link(headers):
     return None
 
 
-def latest_release(project, token):
+def latest_release(project, token, mirror=""):
     if project.prerelease:
         path = f"/repos/{project.repo}/releases?per_page=10"
         seen = set()
         while path and path not in seen:
             seen.add(path)
-            rels, headers = gh_json_response(path, token)
+            if mirror:
+                rels, headers = gh_json_response(path, token, mirror)
+            else:
+                rels, headers = gh_json_response(path, token)
             if not isinstance(rels, list):
                 raise RuntimeError("GitHub releases API 返回了非列表数据")
             for index, release in enumerate(rels):
@@ -302,7 +356,10 @@ def latest_release(project, token):
                     return release
             path = _next_link(headers)
         raise RuntimeError("没有找到任何 release")
-    release = gh_json(f"/repos/{project.repo}/releases/latest", token)
+    if mirror:
+        release = gh_json(f"/repos/{project.repo}/releases/latest", token, mirror)
+    else:
+        release = gh_json(f"/repos/{project.repo}/releases/latest", token)
     _validate_release(release, "GitHub latest release", require_assets=True)
     return release
 
@@ -1054,7 +1111,11 @@ def place_deb(deb: Path, st: Settings, project=None, asset_arch=None,
 # ── 同步单个项目 ──────────────────────────────────────────────────────
 
 def sync_project(project, st, state, force):
-    rel = latest_release(project, st.token)
+    mirror = getattr(st, "github_mirror", "")
+    if mirror:
+        rel = latest_release(project, st.token, mirror)
+    else:
+        rel = latest_release(project, st.token)
     tag = rel.get("tag_name") or ""
     prev = state.get(project.name, {})
     files_ok = bool(prev.get("files")) and all(
@@ -1087,7 +1148,12 @@ def sync_project(project, st, state, force):
             print(f"    下载 {asset_name} ({asset.get('size', 0) // 1024} KiB)")
             dest = tmpdir / asset_name
             digest = parse_digest(asset.get("digest"))
-            download(asset["browser_download_url"], dest, asset.get("size"), digest)
+            download(
+                mirror_github_url(asset["browser_download_url"], mirror),
+                dest,
+                asset.get("size"),
+                digest,
+            )
             deb = dest if project.type == "deb" else build_deb(
                 project, version, arch, dest, tmpdir, st)
             metadata = validate_deb_metadata(
@@ -2114,7 +2180,11 @@ def cmd_check(args):
     updates = failures = 0
     for p in projects:
         try:
-            tag = latest_release(p, st.token).get("tag_name")
+            if st.github_mirror:
+                tag = latest_release(
+                    p, st.token, st.github_mirror).get("tag_name")
+            else:
+                tag = latest_release(p, st.token).get("tag_name")
         except Exception as e:
             failures += 1
             print(f"? {p.name}: 查询失败 ({e})")
@@ -2275,6 +2345,23 @@ def cmd_assets(args):
     except ConfigError as e:
         sys.exit(f"配置错误: {e}")
 
+    token = os.environ.get("GITHUB_TOKEN", "")
+    mirror = os.environ.get("GITHUB_MIRROR", "")
+    config_path = getattr(args, "config", None)
+    if config_path:
+        try:
+            st, _projects, _broken = load_config(config_path, strict=False)
+        except SystemExit:
+            raise
+        token = st.token
+        mirror = st.github_mirror
+    mirror_override = getattr(args, "mirror", None)
+    if mirror_override is not None:
+        try:
+            mirror = _config_github_mirror(mirror_override)
+        except ConfigError as e:
+            sys.exit(f"配置错误: {e}")
+
     class P:
         pass
 
@@ -2282,7 +2369,10 @@ def cmd_assets(args):
     project.repo = repo
     project.prerelease = args.prerelease
     try:
-        rel = latest_release(project, os.environ.get("GITHUB_TOKEN", ""))
+        if mirror:
+            rel = latest_release(project, token, mirror)
+        else:
+            rel = latest_release(project, token)
     except Exception as e:
         sys.exit(f"查询 release 失败: {e}")
     print(f"# {args.repo} {rel.get('tag_name')}")
@@ -2315,6 +2405,10 @@ def main():
     sp = sub.add_parser("assets", help="列出仓库最新 release 的资产名(帮助写正则)")
     sp.add_argument("repo", help="owner/name")
     sp.add_argument("--prerelease", action="store_true", help="包含预发布版本")
+    sp.add_argument("-c", "--config",
+                    help="读取 token/github_mirror 的配置文件(可选)")
+    sp.add_argument("--mirror",
+                    help="临时覆盖 github_mirror,必须是 HTTPS URL")
     sp.set_defaults(func=cmd_assets)
 
     args = ap.parse_args()

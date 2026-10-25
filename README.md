@@ -88,6 +88,42 @@ amd64 和 arm64 客户端都可以使用，前提是项目提供对应架构。
 python3 ghapt.py assets sharkdp/fd
 ```
 
+如果 GitHub 访问较慢，可以在 `[settings]` 配置自己的加速镜像：
+
+```ini
+github_mirror = https://gh.syrix.space
+```
+
+也可以把 `GITHUB_MIRROR=https://gh.syrix.space` 写入
+`/etc/ghapt/env`，由 systemd 服务读取。
+
+ghapt 会把支持的 GitHub HTTPS URL 改写为完整 URL 前缀形式，例如：
+
+```text
+https://api.github.com/repos/user/repo/releases/latest
+→ https://gh.syrix.space/https://api.github.com/repos/user/repo/releases/latest
+```
+
+API 请求、分页请求和 release 资产下载都会经过该镜像。镜像需要支持
+`github.com`、`raw.githubusercontent.com`、`gist.githubusercontent.com`、
+`gist.github.com`、`api.github.com`、`codeload.github.com` 和
+`github.githubassets.com` 这些域名。`assets` 命令也可以使用同一配置：
+
+```bash
+python3 ghapt.py assets sharkdp/fd -c /etc/ghapt/config.ini
+```
+
+也可以只为一次 `assets` 查询指定镜像：
+
+```bash
+python3 ghapt.py assets sharkdp/fd --mirror https://gh.syrix.space
+```
+
+如果配置了 GitHub token，Authorization 请求头会发送给这个镜像，因此只应
+使用自己信任的镜像服务。镜像不可用时同步会失败，ghapt 不会自动回退到
+GitHub 直连；下载完成后仍会校验 GitHub release 提供的文件大小和 SHA256
+digest。镜像不支持 HTTPS 或包含用户信息、查询参数、fragment 时，配置会被拒绝。
+
 然后在 `/etc/ghapt/config.ini` 添加配置。资产正则必须恰好匹配一个文件，建议使用 `^` 和 `$`，并排除 `.sha256`、`musl` 等不需要的变体：
 
 ```ini

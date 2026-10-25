@@ -16,7 +16,7 @@ python3 tests/run_all.py
 
 ```text
 python3 -m unittest -v tests.test_high_priority tests.test_medium_priority
-20 tests, OK
+24 tests, OK
 ```
 
 其他静态检查：
@@ -67,6 +67,7 @@ gpg: can't connect to the agent
 - Release 两种签名、公钥指纹和内容一致性校验；
 - state/cache/lock 的结构校验、路径保护、符号链接拒绝和原子写入；
 - GitHub 预发布 release 分页；
+- GitHub 加速镜像的 URL 改写、API 请求和资产下载；
 - 配置语法错误和损坏 deb 的可控错误；
 - 当前 component 隔离；
 - pool 规范布局、数字开头的合法包名、嵌套目录/临时文件/符号链接拒绝；
