@@ -2,52 +2,75 @@
 
 审查对象：`/home/syrix/ghapt`
 
-审查日期：2026-10-24
+审查日期：2026-10-25
 
-这份文档记录审查时观察到的行为、复现证据、测试限制、已完成修复和待修复项目。
+本报告记录当前实现、修复状态、验证证据和仍然存在的运行环境限制。历史报告中的现象如果已经修复，会明确标为“修复前行为”。
 
-## Git 管理说明
+## Git 状态
 
-仓库已经迁移为标准 Git 布局，唯一的 Git 元数据目录是项目根目录下的 `.git`。审查基线提交为：
+仓库已经重新建立为唯一的标准 Git 工作树，当前已有提交：
 
 ```text
 5b6b630 chore: establish audit baseline
+b6971ca fix: address high-priority repository consistency issues
+3f289b0 fix: complete medium-priority robustness fixes
 ```
 
-本轮修复暂时保留在工作区，尚未创建修复提交。若当前运行环境仍将 `.git/index` 作为只读文件暴露，修改源码和测试不受影响，但 `git add`、提交和更新索引需要在可写的 Git 工作区中执行。
+本轮继续修复和文档同步没有创建 commit，用户可以在检查工作区后自行提交。
 
-## 本轮修复状态
+## 当前已修复的问题
 
-已完成并补充回归测试：
+### 高优先级
 
-- 无变化的 `sync_project()` 返回空列表，第二次 `sync` 不再因把 `False` 加入列表而失败。
-- `type=deb` 直接使用包内版本，不再要求 Git tag 匹配 `strip_prefix`。
-- 收录 `.deb` 前校验 `Package`、`Architecture` 和 Debian `Version`，binary 模式还校验重打包版本。
-- 多架构包先全部准备，再以项目为单位提交到 pool；提交失败时回滚已经写入的架构。
-- 拒绝多个资产架构映射到同一个 pool 文件，并在底层收录路径再次校验 Debian 版本。
-- `index_matches()` 验证 `Release.gpg`、`InRelease`、签名指纹和 InRelease 解出的 `Release` 内容。
-- `publish()` 在 staging 树中生成索引、签名和公钥，切换失败时恢复旧发布树并清理临时目录。
-- 严格校验 `state.json` 和 `index-cache.json` 的结构、路径和摘要字段。
-- 预发布 release 跟随 GitHub `Link` 分页，配置语法错误和损坏 deb 转换为可控失败。
-- 限制路径组成部分、隔离 component、校验 pool deb 文件名，并使用唯一临时文件原子写入状态和缓存。
+- **幂等同步失败**：修复前无变化的 `sync_project()` 返回 `False`，调用方把它当可迭代对象处理，第二次 `sync` 会失败。现在无变化返回空列表，并覆盖第二次同步退出码。
+- **多架构半提交**：所有架构先下载、校验和准备，之后再按项目提交到 pool；后续架构失败会回滚本轮已经写入的文件。
+- **发布半提交**：索引、Release、两种签名和公钥都在 staging 树准备完成后才切换。发布失败时会恢复旧发布树并清理临时目录。
+- **签名未验证**：`index_matches()` 现在验证 `Release.gpg`、`InRelease`、签名指纹，以及 InRelease 解出的 Release 内容。签名损坏、密钥不匹配或公钥缺失都会触发重发布。
+- **deb 版本来源错误**：`type=deb` 直接使用并校验包内版本，不再要求 Git tag 匹配 `strip_prefix`。`type=binary` 仍从 tag 生成 Debian 版本，并将预发布后缀映射为 `~`。
+- **deb 元数据错配**：收录前校验包内 `Package`、`Version`、`Architecture` 与项目配置和资产架构的关系，避免错误资产进入错误索引。
 
-新增的 `tests/test_high_priority.py` 覆盖上述修复和重复 pool 目标边界，共 7 项回归测试；`tests/scenario_1_happy.py` 也检查第二次 `sync` 的退出码。
-新增的 `tests/test_medium_priority.py` 覆盖中优先级修复，共 6 项回归测试。
+### 中优先级
 
-## 验证范围和限制
+- **状态文件结构不受控**：严格校验 `state.json` 的顶层、项目记录、tag、文件路径和架构映射。
+- **哈希缓存不受控**：严格校验 `index-cache.json` 的顶层、路径、文件属性和 MD5/SHA1/SHA256 字段；坏条目被丢弃，不会直接污染索引。
+- **预发布分页缺失**：预发布模式会跟随 GitHub `Link` 头分页，直到找到可用 release 或确认列表结束。
+- **配置错误直接 traceback**：配置解析、重复 section/option、编码错误和字段校验错误会转换成可读的配置错误。
+- **损坏 deb 直接 traceback**：索引生成和清理阶段会报告具体文件和子进程 stderr，并以可控错误停止发布。
+- **路径穿越和符号链接**：suite、component、package、架构、state/cache/lock 和 pool 路径均做安全校验；仓库路径链中的符号链接会被拒绝。
+- **component 污染**：索引和清理只扫描当前配置的 `pool/<component>`，其他 component 的包不会混入当前索引。
+- **pool 结构不规范**：只接受 `pool/<component>/<首字符>/<package>/<package>_<version>_<arch>.deb`；首字符目录支持合法的数字包名，例如 `7zip`，错误层级、嵌套目录、临时文件和符号链接会被拒绝。
+- **旧 suite 清理缺少路径保护**：删除前重新检查父目录和目标路径，旧 suite 符号链接只删除链接本身，不跟随到仓库外。
 
-已执行：
+### 其他已修复或加固项
+
+- GitHub asset 的 `sha256:<64 位十六进制>` digest 在下载后校验；没有 digest 时兼容地退化为 size 校验，格式错误会使同步失败。
+- `.tar.zst` 和 `.tzst` 通过系统 `zstd` 解包；未知压缩容器不会被静默当成可执行文件发布。
+- pool、state 和缓存写入采用同目录临时文件、`fsync()` 和 `os.replace()`。
+- `state` 锁使用 `flock`，并拒绝预先存在的符号链接。
+- `gc` 对缺失/损坏 state、丢失仍在配置项目记录和异常 pool 结构进行保护，避免误删整个仓库。
+- `keep_versions` 要求至少为 1。
+- `check` 在“有更新”和“查询失败”同时发生时返回查询失败码 2。
+- `ensure_key()` 校验配置 UID、指纹、有效期、撤销状态和签名能力。
+- `setup.sh` 将可能包含 token 的 `/etc/ghapt/config.ini` 和 `/etc/ghapt/env` 设置为 `ghapt:ghapt`、`0600`；递归修正 `/srv/ghapt` 所有权时不跟随内部符号链接；nginx 配置安装失败时统一回滚。
+
+## 测试结果
+
+离线回归单元测试当前通过：
+
+```text
+python3 -m unittest -v tests.test_high_priority tests.test_medium_priority
+20 tests, OK
+```
+
+静态检查通过：
 
 ```text
 python3 -m py_compile ghapt.py tests/*.py
-python3 -m unittest -v tests.test_high_priority
-python3 -m unittest -v tests.test_medium_priority
+bash -n setup.sh
 git diff --check
 ```
 
-语法检查、两组回归测试和 diff 检查均通过：高优先级 `7/7`，中优先级 `6/6`。
-
-完整测试当前结果为 `36 PASS / 19 FAIL`，且只有 `5/6` 个场景正常返回。失败的共同根因是当前 Codex 沙箱无法让 GnuPG agent 绑定 Unix socket：
+完整场景测试使用真实的 `dpkg-deb`、`gpg`、APT 和本地 file API 夹具。当前运行结果应以 `tests/REPORT.md` 和 `tests/logs/*.log` 为准。当前环境中 GnuPG 组件实际存在，但 Codex 沙箱禁止 `gpg-agent` 创建 Unix domain socket：
 
 ```text
 gpg: failed to start agent '/usr/bin/gpg-agent'
@@ -55,154 +78,20 @@ gpg: can't connect to the agent
 绑定套接字到 '/tmp/.../S.gpg-agent' 时出现错误：不允许的操作
 ```
 
-系统中实际存在 `gpg`、`gpg-agent`、`gpgconf`、`gpg-connect-agent` 和 pinentry，版本为 GnuPG `2.2.27`。因此这不是缺少可执行文件，也不是 pinentry 交互导致的失败；是沙箱的 seccomp/IPC 限制拒绝了 Unix domain socket 的 bind。`--pinentry-mode loopback` 也不能绕过 socket 创建失败。真实部署还应结合 `systemd/ghapt-sync.service` 的沙箱设置验证。
+这不是缺少 `gpg`、`gpg-agent` 或 pinentry，也不是 pinentry 交互失败；失败发生在 agent 为 `S.gpg-agent` 等 socket 执行 `bind` 时，属于当前沙箱的 seccomp/IPC 限制。`--pinentry-mode loopback` 也无法绕过 agent socket 创建。真实服务器仍需验证 systemd 服务的运行时沙箱和 GPG 行为。
 
-测试运行器只统计日志中已经写出的 `[PASS]` 和 `[FAIL]`，场景在 traceback 后尚未执行的断言不会自动计入失败。因此 `tests/REPORT.md` 声称的“183 项全部通过”不能作为当前版本的完整验证证据。该报告的场景表合计为 `35 + 24 + 10 + 33 + 13 = 115`，与正文中的 `153`、`159`、`170`、`183` 互相矛盾。
+最近一次完整场景运行记录为 `34 PASS / 21 FAIL`，6 个场景中 5 个非零退出。失败都发生在需要 GPG 签名的路径，并共享上述 agent socket `bind` 限制；这次结果不能等同于 21 个业务缺陷。
 
-## 高优先级问题
+`tests/run_all.py` 只统计日志中已经出现的 `[PASS]` 和 `[FAIL]`。场景在 traceback 后尚未执行的断言不会自动计为失败，因此旧版报告中“115/153/159/170/183 项全部通过”的数字不能作为当前完整验证证据；原场景表本身也存在 `35 + 24 + 10 + 33 + 13 = 115` 与正文数字互相矛盾的问题。
 
-### P1：幂等 sync 第二次运行会失败（已修复）
+## 当前仍存在的限制
 
-`sync_project()` 在项目已经是最新时返回布尔值 `False`，而 `cmd_sync()` 无条件执行 `touched += sync_project(...)`。第二次同步打印“已是最新”后会触发 `TypeError: 'bool' object is not iterable`，最终以非零退出。多个项目中只要有一个项目无变化，整体同步也可能失败。
+- **未实现 Acquire-By-Hash**：发布目录在切换过程中仍有极短的目录替换窗口。APT 可能在这个窗口观察到新旧索引混合并报告 `Hash Sum mismatch`；APT 通常会保留旧索引并允许下次重试。若需要消除这个窗口，应实现 `Acquire-By-Hash` 目录和对应 Release 元数据。
+- **state 保存失败的恢复语义**：索引发布成功后才保存 state。若 state 保存失败，命令返回失败、旧版本暂不删除，仓库索引已经更新。修复 state 后再次运行会重新收敛；期间需要关注日志和磁盘占用。
+- **发布目录切换不是无窗口切换**：staging 树降低了索引文件互相不一致的时间和范围，但目录重命名本身仍可能产生极短的观察窗口。
+- **缓存的理论碰撞**：缓存同时使用 size、mtime、ctime、device、inode 和三种摘要，正常文件替换可以被识别；如果所有身份和时间属性都被恶意恢复，任何基于元数据的缓存仍存在极端碰撞可能。
+- **真实部署尚未在本环境完整端到端验证**：包括真实 GitHub HTTP API、CDN 重定向、限流、systemd 运行时沙箱、nginx reload、`setup.sh` 的 root 流程和 Python 3.8 运行时。当前测试使用本地 file API 夹具，systemd 只做过静态单元校验。
 
-相关位置：`ghapt.py` 中的 `sync_project()` 和 `cmd_sync()`。
+## 结论
 
-修复结果：无变化时返回空列表，并增加第二次 `sync` 退出码必须为 0 的断言。
-
-### P1：publish() 不是事务操作（已修复）
-
-`publish()` 为索引、Release 和签名生成临时文件，却逐个调用 `os.replace()`。如果中途替换失败，仓库会出现新旧索引混合、Release 与索引不匹配、签名对应旧内容以及残留 `.new` 文件的状态。公钥导出发生在索引替换之后，导出失败也可能留下“索引已更新、公钥未更新”的半提交。
-
-已通过注入 `os.replace()` 异常复现：`Packages` 已是新内容，而 `Packages.gz`、`Release`、`Release.gpg` 和 `InRelease` 仍为旧内容。
-
-修复结果：使用 staging 目录生成完整发布树和公钥，切换失败时恢复旧 `dist` 和公钥，并删除 staging。测试覆盖切换失败后的恢复和清理。目录切换仍会产生极短的“旧目录已改名、新目录尚未改名”窗口；若部署要求发布期间绝对不能出现目录缺失，应进一步改为稳定 symlink 或版本目录指针。
-
-### P1：索引一致性检查不验证 GPG 签名（已修复）
-
-`index_matches()` 只检查 `Release`、`Release.gpg`、`InRelease` 是否存在，比较 Release 中的哈希表，并比较 Packages 文件字节。它不验证 detached signature、clearsigned signature、签名密钥或签名内容。
-
-已构造正确的 Packages 和 Release 哈希，但把两个签名替换为垃圾内容；`index_matches()` 仍返回 `(True, '')`。之后 sync 会跳过重新签名，APT 客户端才会发现签名无效。
-
-修复结果：使用仓库导出的公钥验证两种签名，检查签名指纹，并比较 InRelease 解出的内容与 `Release`。签名损坏、密钥缺失或签名不是当前仓库密钥时会强制重新发布。
-
-### P1/P2：deb 模式错误地依赖 Git tag 生成 Debian 版本（已修复）
-
-`sync_project()` 对所有项目无条件调用 `deb_version_from_tag()`。`type=deb` 的版本应从 `.deb` 内部读取，tag 主要用于选择 release；一个合法的 `release-1.0.0` tag 会因为默认 `strip_prefix=v` 而在下载前失败。
-
-修复结果：只有 `type=binary` 从 tag 生成版本；`type=deb` 使用并校验包内版本。
-
-### P1/P2：deb 包内部元数据没有和配置校验（已修复）
-
-`place_deb()` 以包内的 `Package`、`Version` 和 `Architecture` 命名和归类，但没有检查它们是否匹配配置的项目包名和 asset 架构。配置声明的包可能实际发布成另一个包，配置的 `amd64` asset 也可能包含 `arm64` 包，state 仍会错误记录为 `amd64`。
-
-修复结果：校验 `Package == project.package`、`Architecture` 是否匹配 asset 架构键或为 `all`，以及 Debian 版本格式；binary 模式另外要求包内版本等于 tag 映射版本。
-
-### P1/P2：多架构收录仍可能半提交（已修复）
-
-下载和构建虽然已经按项目完成两阶段处理，但 `place_deb()` 仍逐架构写入 pool。第一个架构写入成功、第二个架构失败时，第一个包已经落盘，而 state 尚未更新。
-
-已复现：`amd64` 包出现在 pool，`state.json` 仍为空。
-
-修复结果：所有架构先复制到项目级 staging，目标文件替换失败时恢复本轮已经提交的文件，并清理 staging。
-
-## 中优先级问题
-
-### P2：state.json 只检查 JSON 语法，不检查结构（已修复）
-
-以下内容可能被接受并在后续流程中触发异常或错误状态：
-
-```json
-[]
-```
-
-```json
-null
-```
-
-```json
-{"project": {"files": []}}
-```
-
-修复结果：严格模式要求顶层为对象，项目记录、`tag`、`files`、架构键和文件路径均通过结构及路径校验；路径必须是仓库内 `pool/` 下的 `.deb` 文件。普通同步模式遇到损坏状态时给出警告并按空状态处理，`check`/`gc` 等严格流程继续拒绝执行。
-
-### P2：损坏的 index-cache 可能 traceback 或污染索引（已修复）
-
-缓存顶层为 `[]` 或 `null` 时会在 `.items()` 处抛异常。当前只检查值是长度为 5 的 list，不检查 size、mtime、摘要长度和十六进制格式。伪造 size/mtime 可能使错误摘要直接进入 Packages 和 Release。
-
-修复结果：缓存顶层非对象时退化为空缓存，并逐条检查路径、size、mtime、MD5、SHA1 和 SHA256 的类型、范围及格式；非法条目被丢弃，命中缓存前再次验证条目结构。
-
-### P2：预发布模式只读取 GitHub 前 10 个 release（已修复）
-
-请求使用 `per_page=10`，没有处理 GitHub Link 分页。如果前 10 个都是 draft 或不符合条件，而第 11 个才是可用 release，会错误报告没有 release。
-
-修复结果：解析 GitHub `Link` 响应头并跟随 `rel="next"`，直到找到非 draft release 或确认分页结束。
-
-### P2：配置解析异常没有转换成可控错误（已修复）
-
-`ConfigParser.read()` 及相关解析过程没有完整捕获 `configparser.Error`。语法错误、缺少 section、重复 section 或重复 option 可能直接 traceback。
-
-修复结果：捕获 `configparser.Error` 和 UTF-8 解码错误，转换为带配置文件路径的稳定错误和非零退出码。
-
-### P2：pool 中损坏的 deb 会导致 traceback（已修复）
-
-`generate_indexes()` 扫描 pool 后直接读取每个 `.deb` 的 control 信息。损坏包会抛异常，且该过程发生在发布异常处理之前，可能把用户带入 traceback。
-
-修复结果：索引生成捕获 deb 读取和哈希异常，错误中包含具体路径；`sync`/`gc` 在发布或删除前停止并返回非零，不产生未处理 traceback。
-
-### P2：路径组成部分缺少安全校验（已修复）
-
-`component`、`suite`、项目包名和架构等值参与路径拼接，没有限制绝对路径、`..` 和路径分隔符。已用 `component = ../../outside` 复现仓库目录外写入风险。
-
-修复结果：`suite`、`component`、`package`、架构键等配置值限制为安全的单一路径组成部分，pool 和状态/缓存路径还会在解析后确认位于仓库范围内。
-
-### P2：切换 component 后旧 component 会污染新索引（已修复）
-
-索引生成扫描整个 `repo/pool`，但索引路径使用当前 component。配置从一个 component 切换到另一个后，旧 component 的 deb 可能进入新 component 的 Packages，而 Filename 仍指向旧 component。
-
-修复结果：索引生成和清理计划只扫描当前配置的 `pool/<component>`，旧 component 的包不会进入新 component 的索引，也不会被当前 component 的清理逻辑误删。
-
-### P2：异常命名的 pool deb 可能导致清理阶段崩溃（已修复）
-
-`prune_pool_plan()` 和 `prune_candidates()` 原先通过字符串切分推断版本和架构。pool 中出现命名异常的 `.deb` 时，清理逻辑可能抛出 `IndexError`，并且错误不指向具体文件。
-
-修复结果：统一解析 `<package>_<version>_<architecture>.deb`，校验包名、架构和 Debian 版本；异常文件会阻止清理并报告具体路径。
-
-### P2：状态和缓存写入使用固定临时文件（已修复）
-
-`state.json` 和 `index-cache.json` 原先使用固定的 `.tmp` 文件名。外部并发进程或残留临时文件可能互相覆盖，写入中断也可能留下不完整文件。
-
-修复结果：使用同目录唯一临时文件，写入并 `fsync()` 后通过 `os.replace()` 原子替换；异常时清理临时文件。
-
-## 其他风险和改进项
-
-- 发布索引后删除旧版本或保存 state 失败，可能导致状态文件与实际 pool 不一致。
-- Release 的 Origin、Label、Description 等元数据变化不会单独触发重发布。
-- `ghapt.gpg` 或 `ghapt.asc` 被删除/损坏时，如果索引仍匹配，普通 sync 不会重新导出公钥。
-- 仅使用 mtime 和 size 的缓存无法检测同大小且 mtime 恰好相同的内容替换。
-- suite 修改后旧的 `dists/<old-suite>` 不会自动删除。
-- `place_deb()` 写入临时文件时若中途异常，清理依赖后续流程，应显式清理。
-- `ensure_key()` 只选第一个 secret key，没有确认它对应配置的 key name/email，也没有检查签名能力。
-- `setup.sh` 将可能包含 token 的配置安装为 `0644`，同机其他用户可读取。
-
-## 已确认的历史修复
-
-以下修复在当前源码中确实存在：
-
-- 所有架构先下载、校验、构建，再写入 pool。
-- 校验 GitHub `sha256:<hex>` digest。
-- 使用系统 `zstd` 处理 `.tar.zst` 和 `.tzst`。
-- 未知压缩容器不再静默作为裸程序发布。
-- `asset.<arch>` 与 `settings.architectures` 交叉校验。
-- pool 写入使用 `.new` 加 `os.replace()`。
-- 子进程 stderr 会进入错误信息。
-- GC 对缺失/损坏 state 及配置中的项目包有保护。
-- `keep_versions >= 1`。
-- `check` 在查询失败和有更新同时出现时返回查询失败码。
-- 预发布 tag 使用 Debian `~` 语义。
-- `strip_prefix` 不匹配时明确报错。
-
-## 后续工作
-
-剩余风险主要集中在发布后 state/pool 的故障恢复、缓存的极端碰撞、旧 suite 清理、公钥选择与能力校验、pool 临时文件清理，以及 `setup.sh` 的配置权限。完整端到端 GPG 测试仍需要具备可用 Unix socket 的环境；当前沙箱限制已在“验证范围和限制”中记录。
-
-本轮已修改 `ghapt.py`、新增 `tests/test_medium_priority.py` 并更新本审查文档；未创建 commit。
+此前审查提出的高优先级和中优先级问题已经落实到源码并有回归测试覆盖。本轮还补齐了 pool 结构校验、数字开头 Debian 包名、旧 suite 路径保护、nginx 失败回滚、递归 chown 安全和相关文档。剩余工作主要是 Acquire-By-Hash、真实部署环境验证，以及 state 保存失败和发布目录切换窗口的运维监控。
