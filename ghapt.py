@@ -25,6 +25,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -1030,6 +1031,17 @@ def validate_pool_deb_metadata(st, path, fields, metadata):
     return metadata
 
 
+def _ensure_public_deb(st, path):
+    """Repair public package permissions without touching private repo data."""
+    path = _ensure_repo_file(st, path, "pool deb")
+    info = path.stat()
+    if not stat.S_ISREG(info.st_mode):
+        raise RuntimeError(f"pool deb 不是普通文件: {path}")
+    # Avoid needless ctime changes, which invalidate the package hash cache.
+    if stat.S_IMODE(info.st_mode) != 0o644:
+        path.chmod(0o644)
+
+
 def _stage_and_commit_debs(st, entries):
     """Stage every deb for a project, then commit all pool files as one unit."""
     _ensure_repo_root(st, create=True)
@@ -1048,6 +1060,8 @@ def _stage_and_commit_debs(st, entries):
             staged = stage_root / rel
             staged.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(deb, staged)
+            # Downloads are private (0600); only published copies become public.
+            staged.chmod(0o644)
             records.append((arch, staged, target, rel))
 
         # Prepare all backups before changing pool. If a copy fails, no target
@@ -1060,6 +1074,7 @@ def _stage_and_commit_debs(st, entries):
             same = target.exists() and file_hashes(target)[3] == file_hashes(staged)[3]
             changes[arch] = not same
             if same:
+                _ensure_public_deb(st, target)
                 continue
             target.parent.mkdir(parents=True, exist_ok=True)
             if target.exists():
@@ -1121,6 +1136,8 @@ def sync_project(project, st, state, force):
     files_ok = bool(prev.get("files")) and all(
         (st.repo_dir / f).exists() for f in prev["files"].values())
     if not force and prev.get("tag") == tag and files_ok:
+        for relpath in prev["files"].values():
+            _ensure_public_deb(st, st.repo_dir / relpath)
         print(f"[ok] {project.name}: 已是最新 ({tag})")
         return []
 
@@ -1391,6 +1408,7 @@ def generate_indexes(st, exclude=(), cache=None):
             try:
                 fields, d = deb_control(p)
                 validate_pool_deb_metadata(st, p, fields, d)
+                _ensure_public_deb(st, p)
                 size, md5, sha1, sha256 = hashes_of(p, relpath, cache)
             except (OSError, RuntimeError, ValueError) as e:
                 raise RuntimeError(f"无法读取 pool 中的 deb {p}: {e}") from e
